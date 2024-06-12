@@ -1,7 +1,9 @@
 mod i8042;
+mod rtc;
 mod serial;
 
 pub use i8042::I8042;
+pub use rtc::Rtc;
 pub use serial::Serial;
 
 use crate::{Error, Result};

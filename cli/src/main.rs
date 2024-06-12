@@ -1,6 +1,6 @@
 use clap::Parser;
 use microcosm::{
-    device::{Serial, I8042},
+    device::{Rtc, Serial, I8042},
     Hypervisor,
 };
 use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg, Termios};
@@ -102,6 +102,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut guest = builder.build()?;
     guest.add_device(Mutex::new(I8042::new()))?;
+    guest.add_device(Mutex::new(Rtc::new()))?;
 
     let serial = Arc::new(Mutex::new(Serial::new(0, guest.irq())));
     guest.add_device(serial.clone())?;
