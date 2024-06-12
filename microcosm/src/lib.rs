@@ -47,7 +47,7 @@ pub enum Error {
     Syscall(#[from] nix::Error),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct KernelParams {
     cmdline: Option<CString>,
     initrd_path: Option<PathBuf>,

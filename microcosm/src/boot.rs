@@ -97,6 +97,7 @@ impl Bootable {
             sregs.cr4 |= 0x20; // PAE
             sregs.efer |= 0x500; // LME | LMA
         }
+        self.protocol.configure_sregs(sregs);
     }
 
     pub fn configure_regs(&self, regs: &mut kvm_regs) {
