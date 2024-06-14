@@ -1,5 +1,5 @@
 use crate::{
-    boot::{Bootable, EBDA_START, HIGH_MEMORY_START},
+    boot::{Bootable, EBDA_START, HIGH_MEMORY_START, RSDP_ADDR},
     memory::{CopyToGuest, RangeAllocator},
     Error, KernelParams, Result,
 };
@@ -324,6 +324,7 @@ fn load_pvh(
         magic: XEN_HVM_START_MAGIC_VALUE,
         version: 1,
         cmdline_paddr,
+        rsdp_paddr: RSDP_ADDR,
         memmap_paddr,
         memmap_entries: memmap_entries.len() as u32,
         ..Default::default()
@@ -378,6 +379,7 @@ fn write_linux_boot_params(
 
     let mut boot_params = boot_params {
         hdr,
+        acpi_rsdp_addr: RSDP_ADDR,
         ..Default::default()
     };
 

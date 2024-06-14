@@ -5,6 +5,7 @@
     non_upper_case_globals
 )]
 
+pub mod acpi;
 pub mod bootparam;
 pub mod e820;
 pub mod elf;

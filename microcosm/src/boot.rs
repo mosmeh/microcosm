@@ -1,8 +1,21 @@
-use crate::{load::BootProtocol, memory::CopyToGuest, Result};
-use std::mem::size_of;
-use sys::kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs};
+use crate::{
+    load::BootProtocol,
+    memory::{CopyToGuest, RangeAllocator},
+    Result,
+};
+use std::{ffi::c_char, mem::size_of};
+use sys::{
+    acpi::{
+        acpi_madt_io_apic, acpi_madt_local_apic, acpi_madt_type_ACPI_MADT_TYPE_IO_APIC,
+        acpi_madt_type_ACPI_MADT_TYPE_LOCAL_APIC, acpi_subtable_header, acpi_table_header,
+        acpi_table_madt, acpi_table_rsdp, ACPI_MADT_ENABLED, ACPI_RSDP_CHECKSUM_LENGTH,
+        ACPI_SIG_MADT, ACPI_SIG_RSDP, ACPI_SIG_XSDT,
+    },
+    kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs},
+};
 use zerocopy::AsBytes;
 
+#[derive(Clone)]
 pub struct Bootable {
     pub protocol: BootProtocol,
     pub entry_addr: u64,
@@ -108,13 +121,115 @@ impl Bootable {
     }
 }
 
+pub fn configure_acpi(memory: &mut [u8], num_cpus: usize) -> Result<()> {
+    macro_rules! signature {
+        ($($c:expr)*) => {[$($c as c_char,)*]};
+        ($s:expr; 4) => {signature!($s[0] $s[1] $s[2] $s[3])};
+        ($s:expr; 8) => {signature!($s[0] $s[1] $s[2] $s[3] $s[4] $s[5] $s[6] $s[7])};
+    }
+
+    macro_rules! checksum {
+        ($($x:expr),*) => {{
+            let mut sum = 0u8;
+            $(
+                for &b in $x.as_bytes() {
+                    sum = sum.wrapping_add(b);
+                }
+            )*
+            (u8::MAX - sum).wrapping_add(1)
+        }};
+    }
+
+    let mut allocator = RangeAllocator::new(RSDP_ADDR);
+    let xsdp_size = size_of::<acpi_table_rsdp>();
+    let xsdp_addr = allocator.raw_alloc(xsdp_size, 16);
+    assert_eq!(xsdp_addr, RSDP_ADDR);
+
+    let xsdt_size = size_of::<acpi_table_header>() + size_of::<u64>();
+    let xsdt_addr = allocator.raw_alloc(xsdt_size, 1);
+
+    let madt_size = size_of::<acpi_table_madt>()
+        + size_of::<acpi_madt_io_apic>()
+        + num_cpus * size_of::<acpi_madt_local_apic>();
+    let madt_addr = allocator.raw_alloc(madt_size, 1);
+
+    let mut xsdp = acpi_table_rsdp {
+        signature: signature!(ACPI_SIG_RSDP; 8),
+        revision: 2, // ACPI 2.0 or later
+        length: xsdp_size as u32,
+        xsdt_physical_address: xsdt_addr,
+        ..Default::default()
+    };
+    xsdp.checksum = checksum!(xsdp.as_bytes()[..ACPI_RSDP_CHECKSUM_LENGTH as usize]);
+    xsdp.extended_checksum = checksum!(xsdp);
+    xsdp.copy_to_guest(memory, xsdp_addr)?;
+
+    let mut xsdt_header = acpi_table_header {
+        signature: signature!(ACPI_SIG_XSDT; 4),
+        length: xsdt_size as u32,
+        revision: 1,
+        ..Default::default()
+    };
+    xsdt_header.checksum = checksum!(xsdt_header, madt_addr);
+    xsdt_header.copy_to_guest(memory, xsdt_addr)?;
+    madt_addr.copy_to_guest(memory, xsdt_addr + size_of::<acpi_table_header>() as u64)?;
+
+    let mut madt_header = acpi_table_madt {
+        header: acpi_table_header {
+            signature: signature!(ACPI_SIG_MADT; 4),
+            length: madt_size as u32,
+            revision: 6, // ACPI 6.5
+            ..Default::default()
+        },
+        address: APIC_BASE,
+        flags: 0,
+    };
+    let madt_io_apic = acpi_madt_io_apic {
+        header: acpi_subtable_header {
+            type_: acpi_madt_type_ACPI_MADT_TYPE_IO_APIC as u8,
+            length: size_of::<acpi_madt_io_apic>() as u8,
+        },
+        id: 0,
+        address: IOAPIC_ADDR,
+        global_irq_base: 0,
+        ..Default::default()
+    };
+    let madt_local_apics: Vec<_> = (0..num_cpus)
+        .map(|id| {
+            let id = id as u8;
+            acpi_madt_local_apic {
+                header: acpi_subtable_header {
+                    type_: acpi_madt_type_ACPI_MADT_TYPE_LOCAL_APIC as u8,
+                    length: size_of::<acpi_madt_local_apic>() as u8,
+                },
+                processor_id: id,
+                id,
+                lapic_flags: ACPI_MADT_ENABLED,
+            }
+        })
+        .collect();
+    madt_header.header.checksum = checksum!(madt_header.header, madt_io_apic, madt_local_apics);
+    let mut addr = madt_addr;
+    madt_header.copy_to_guest(memory, addr)?;
+    addr += size_of::<acpi_table_madt>() as u64;
+    madt_io_apic.copy_to_guest(memory, addr)?;
+    addr += size_of::<acpi_madt_io_apic>() as u64;
+    madt_local_apics.copy_to_guest(memory, addr)?;
+
+    Ok(())
+}
+
 const GDT_BASE: u64 = 0x0500;
 const IDT_BASE: u64 = 0x0530;
 const PAGE_TABLE_ADDR: u64 = 0x8000;
 const STACK_POINTER: u64 = 0x0008_0000;
 
 pub const EBDA_START: u64 = 0x0009_fc00;
+pub const RSDP_ADDR: u64 = 0x000e_0000;
 pub const HIGH_MEMORY_START: u64 = 0x0010_0000;
+
+const IOAPIC_ADDR: u32 = 0xfec0_0000;
+const APIC_BASE: u32 = 0xfee0_0000;
 
 // Follows the Linux x86 boot protocol
 // https://www.kernel.org/doc/Documentation/x86/boot.txt

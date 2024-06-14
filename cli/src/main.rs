@@ -19,6 +19,10 @@ struct Cli {
     #[clap(short, long)]
     kernel: PathBuf,
 
+    /// Number of CPUs
+    #[clap(short = 'n', long, default_value = "1")]
+    cpus: NonZeroUsize,
+
     /// Memory size
     #[clap(short, long, value_parser = try_parse_size, default_value = "64M")]
     memory: NonZeroUsize,
@@ -91,6 +95,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut builder = hypervisor
         .guest(cli.kernel)
+        .num_cpus(cli.cpus)
         .memory_size(cli.memory)
         .cmdline(cli.cmdline);
     if let Some(path) = cli.initrd {

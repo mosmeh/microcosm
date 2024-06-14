@@ -1,6 +1,6 @@
 use crate::{
-    boot::Bootable,
-    device::{PortIoDevice, PortIoHub},
+    boot::{self, Bootable},
+    device::{self, PortIoDevice},
     kvm::{Vcpu, Vm},
     memory::Mmapped,
     Hypervisor, KernelParams, Result,
@@ -19,6 +19,7 @@ use sys::kvm_bindings::{
 pub struct GuestBuilder<'a> {
     hypervisor: &'a Hypervisor,
     kernel_path: PathBuf,
+    num_cpus: NonZeroUsize,
     memory_size: NonZeroUsize,
     kernel_params: KernelParams,
 }
@@ -28,9 +29,16 @@ impl<'a> GuestBuilder<'a> {
         Self {
             hypervisor,
             kernel_path,
+            num_cpus: NonZeroUsize::new(1).unwrap(),
             memory_size: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
             kernel_params: KernelParams::default(),
         }
+    }
+
+    #[must_use]
+    pub fn num_cpus(mut self, num_cpus: NonZeroUsize) -> Self {
+        self.num_cpus = num_cpus;
+        self
     }
 
     #[must_use]
@@ -67,6 +75,7 @@ impl<'a> GuestBuilder<'a> {
         eprintln!("Protocol: {:?}", bootable.protocol);
         eprintln!("Entry: {:#x}", bootable.entry_addr);
         bootable.configure_memory(memory)?;
+        boot::configure_acpi(memory, self.num_cpus.get())?;
 
         let vm = Vm::new(self.hypervisor.kvm.clone())?;
         vm.set_user_memory_region(&kvm_userspace_memory_region {
@@ -81,6 +90,7 @@ impl<'a> GuestBuilder<'a> {
 
         Ok(Guest {
             vm: Arc::new(vm),
+            num_cpus: self.num_cpus,
             port_io_hub: PortIoHub::default(),
             supported_cpuid: self.hypervisor.supported_cpuid.clone(),
             vcpu_mmap_size: self.hypervisor.vcpu_mmap_size,
@@ -90,9 +100,12 @@ impl<'a> GuestBuilder<'a> {
     }
 }
 
+type PortIoHub = device::PortIoHub<Arc<Mutex<dyn PortIoDevice + Send>>>;
+
 pub struct Guest {
     vm: Arc<Vm>,
-    port_io_hub: PortIoHub<Arc<Mutex<dyn PortIoDevice + Send>>>,
+    num_cpus: NonZeroUsize,
+    port_io_hub: PortIoHub,
     supported_cpuid: CpuId,
     vcpu_mmap_size: NonZeroUsize,
     bootable: Bootable,
@@ -114,15 +127,43 @@ impl Guest {
         }
     }
 
-    pub fn run(mut self) -> Result<()> {
-        self.run_vcpu(0)
+    pub fn run(self) -> Result<()> {
+        let cpu = Cpu {
+            vm: self.vm,
+            port_io_hub: Arc::new(Mutex::new(self.port_io_hub)),
+            cpuid: self.supported_cpuid,
+            vcpu_mmap_size: self.vcpu_mmap_size,
+            bootable: self.bootable,
+        };
+        let cpus: Vec<_> = (0..self.num_cpus.get())
+            .map(|id| {
+                let cpu = cpu.clone();
+                std::thread::Builder::new()
+                    .name(format!("cpu{id}"))
+                    .spawn(move || cpu.run(id as u32))
+            })
+            .collect();
+        for cpu in cpus {
+            cpu?.join().unwrap()?;
+        }
+        Ok(())
     }
+}
 
-    fn run_vcpu(&mut self, id: u32) -> Result<()> {
-        let vcpu = Vcpu::new(self.vm.clone(), id)?;
+#[derive(Clone)]
+struct Cpu {
+    vm: Arc<Vm>,
+    port_io_hub: Arc<Mutex<PortIoHub>>,
+    cpuid: CpuId,
+    vcpu_mmap_size: NonZeroUsize,
+    bootable: Bootable,
+}
 
-        let mut cpuid = self.supported_cpuid.clone();
-        for entry in cpuid.as_mut_slice() {
+impl Cpu {
+    fn run(mut self, id: u32) -> Result<()> {
+        let vcpu = Vcpu::new(self.vm, id)?;
+
+        for entry in self.cpuid.as_mut_slice() {
             match entry.function {
                 0x1 => {
                     // Set local APIC ID
@@ -134,13 +175,17 @@ impl Guest {
                         entry.ecx |= 1 << 31;
                     }
                 }
+                0xb => {
+                    // Set x2APIC ID
+                    entry.edx = id;
+                }
                 0x8000_0001 if self.bootable.protocol.is_32bit() => {
                     entry.ecx &= !(1 << 29); // Disable 64-bit mode
                 }
                 _ => {}
             }
         }
-        vcpu.set_cpuid(&cpuid)?;
+        vcpu.set_cpuid(&self.cpuid)?;
 
         let mut sregs = vcpu.sregs()?;
         self.bootable.configure_sregs(&mut sregs);
@@ -175,9 +220,10 @@ impl Guest {
                     let ptr = unsafe { ptr.offset(io.data_offset as isize) };
                     let len = io.size as usize * io.count as usize;
                     let data = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                    let mut port_io_hub = self.port_io_hub.lock().unwrap();
                     match io.direction.into() {
-                        KVM_EXIT_IO_IN => self.port_io_hub.read(io.port, data)?,
-                        KVM_EXIT_IO_OUT => self.port_io_hub.write(io.port, data)?,
+                        KVM_EXIT_IO_IN => port_io_hub.read(io.port, data)?,
+                        KVM_EXIT_IO_OUT => port_io_hub.write(io.port, data)?,
                         _ => eprintln!("Unknown IO direction {}", io.direction),
                     }
                 }
