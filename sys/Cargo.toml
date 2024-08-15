@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-kvm-bindings = { version = "0.8.2", features = ["fam-wrappers"] }
+kvm-bindings = { version = "0.9.0", features = ["fam-wrappers"] }
 nix = { version = "0.29.0", features = ["ioctl"] }
-zerocopy = { version = "0.7.34", features = ["derive"] }
+zerocopy = { version = "0.7.35", features = ["derive"] }
